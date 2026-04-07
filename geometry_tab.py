@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -195,7 +196,8 @@ class GeometryTab(QWidget):
             except (ValueError, TypeError):
                 base_color = plot_colors[row % len(plot_colors)]
 
-            (line2d,) = ax.plot(seg.x, seg.y, color=base_color, linewidth=1.5, zorder=1)
+            plot_x, plot_y = self._segment_plot_xy(seg)
+            (line2d,) = ax.plot(plot_x, plot_y, color=base_color, linewidth=1.5, zorder=1)
             line2d.set_picker(True)
             line2d.set_pickradius(5)
             self.segment_lines.append(line2d)
@@ -383,6 +385,87 @@ class GeometryTab(QWidget):
             idx = 2 * i
             out.append((seg.x[idx], seg.y[idx], seg.x[idx + 1], seg.y[idx + 1]))
         return out
+
+    def _segment_arc_angle_deg(self, seg: Segment) -> float:
+        props = self._ensure_prop_len(seg.properties, 6)
+        try:
+            return float(props[2]) if props[2] else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _arc_points(
+        self, x1: float, y1: float, x2: float, y2: float, ang_deg: float, samples: int = 24
+    ) -> List[Tuple[float, float]]:
+        if abs(ang_deg) < 1e-9:
+            return [(x1, y1), (x2, y2)]
+
+        dx = x2 - x1
+        dy = y2 - y1
+        chord = math.hypot(dx, dy)
+        if chord <= 1e-12:
+            return [(x1, y1), (x2, y2)]
+
+        ang_rad = math.radians(ang_deg)
+        abs_phi = abs(ang_rad)
+        if abs_phi <= 1e-9:
+            return [(x1, y1), (x2, y2)]
+
+        sin_half = math.sin(abs_phi * 0.5)
+        tan_half = math.tan(abs_phi * 0.5)
+        if abs(sin_half) <= 1e-12 or abs(tan_half) <= 1e-12:
+            return [(x1, y1), (x2, y2)]
+
+        radius = chord / (2.0 * sin_half)
+        h = chord / (2.0 * tan_half)
+
+        mx = 0.5 * (x1 + x2)
+        my = 0.5 * (y1 + y2)
+        px = -dy / chord
+        py = dx / chord
+
+        centers = [(mx + px * h, my + py * h), (mx - px * h, my - py * h)]
+        best_center = centers[0]
+        best_a0 = 0.0
+        best_err = float("inf")
+
+        for cx, cy in centers:
+            a0 = math.atan2(y1 - cy, x1 - cx)
+            x2_pred = cx + radius * math.cos(a0 + ang_rad)
+            y2_pred = cy + radius * math.sin(a0 + ang_rad)
+            err = math.hypot(x2_pred - x2, y2_pred - y2)
+            if err < best_err:
+                best_err = err
+                best_center = (cx, cy)
+                best_a0 = a0
+
+        cx, cy = best_center
+        n = max(8, int(samples))
+        pts: List[Tuple[float, float]] = []
+        for i in range(n + 1):
+            t = i / n
+            a = best_a0 + ang_rad * t
+            pts.append((cx + radius * math.cos(a), cy + radius * math.sin(a)))
+        return pts
+
+    def _segment_plot_xy(self, seg: Segment) -> Tuple[List[float], List[float]]:
+        primitives = self._segment_primitives(seg)
+        if not primitives:
+            return list(seg.x), list(seg.y)
+
+        ang_deg = self._segment_arc_angle_deg(seg)
+        xs: List[float] = []
+        ys: List[float] = []
+        for i, (x1, y1, x2, y2) in enumerate(primitives):
+            pts = self._arc_points(x1, y1, x2, y2, ang_deg)
+            if i > 0 and pts:
+                pts = pts[1:]
+            for px, py in pts:
+                xs.append(px)
+                ys.append(py)
+
+        if not xs or not ys:
+            return list(seg.x), list(seg.y)
+        return xs, ys
 
     def _render_normals(self):
         self._clear_normals()
