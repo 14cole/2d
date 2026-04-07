@@ -1254,6 +1254,63 @@ def _cond_estimate(a_mat: np.ndarray) -> float:
         return float("inf")
 
 
+def evaluate_quality_gate(
+    metadata: Dict[str, Any],
+    thresholds: Dict[str, float | int] | None = None,
+) -> Dict[str, Any]:
+    """
+    Evaluate a lightweight numeric quality gate from solver metadata.
+
+    This does not prove correctness; it catches obvious numerical-risk runs.
+    """
+
+    defaults: Dict[str, float | int] = {
+        "residual_norm_max": 1.0e-2,
+        "condition_est_max": 1.0e6,
+        "warnings_max": 10,
+    }
+    merged = dict(defaults)
+    if thresholds:
+        merged.update(dict(thresholds))
+
+    residual_limit = float(merged.get("residual_norm_max", defaults["residual_norm_max"]))
+    condition_limit = float(merged.get("condition_est_max", defaults["condition_est_max"]))
+    warnings_limit = int(merged.get("warnings_max", defaults["warnings_max"]))
+
+    residual_value = float(metadata.get("residual_norm_max", 0.0) or 0.0)
+    condition_value = float(metadata.get("condition_est_max", 0.0) or 0.0)
+    warnings_count = len(list(metadata.get("warnings", []) or []))
+
+    violations: List[str] = []
+    if not math.isfinite(residual_value) or residual_value > residual_limit:
+        violations.append(
+            f"residual_norm_max={residual_value:.6g} exceeds limit {residual_limit:.6g}"
+        )
+    if not math.isfinite(condition_value) or condition_value > condition_limit:
+        violations.append(
+            f"condition_est_max={condition_value:.6g} exceeds limit {condition_limit:.6g}"
+        )
+    if warnings_count > warnings_limit:
+        violations.append(
+            f"warnings_count={warnings_count} exceeds limit {warnings_limit}"
+        )
+
+    return {
+        "passed": len(violations) == 0,
+        "thresholds": {
+            "residual_norm_max": residual_limit,
+            "condition_est_max": condition_limit,
+            "warnings_max": warnings_limit,
+        },
+        "values": {
+            "residual_norm_max": residual_value,
+            "condition_est_max": condition_value,
+            "warnings_count": warnings_count,
+        },
+        "violations": violations,
+    }
+
+
 def _build_system(
     panels: List[Panel],
     s_mat: np.ndarray,
@@ -1632,6 +1689,8 @@ def solve_monostatic_rcs_2d(
     geometry_units: str = "inches",
     material_base_dir: str | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    quality_thresholds: Dict[str, float | int] | None = None,
+    strict_quality_gate: bool = False,
 ) -> Dict[str, Any]:
     """
     Main entry point for monostatic 2D RCS.
@@ -1790,7 +1849,7 @@ def solve_monostatic_rcs_2d(
     done_steps = total_steps
     emit_progress("Completed")
 
-    return {
+    result = {
         "title": geometry_snapshot.get("title", "Geometry"),
         "scattering_mode": "monostatic",
         "polarization": "VV" if pol == "TE" else "HH",
@@ -1819,3 +1878,14 @@ def solve_monostatic_rcs_2d(
             "warnings": list(materials.warnings),
         },
     }
+
+    metadata = result.get("metadata", {}) or {}
+    quality_gate = evaluate_quality_gate(metadata, thresholds=quality_thresholds)
+    metadata["quality_gate"] = quality_gate
+    result["metadata"] = metadata
+
+    if strict_quality_gate and not bool(quality_gate.get("passed", False)):
+        msg = "; ".join(quality_gate.get("violations", []) or ["quality gate failed"])
+        raise ValueError(f"Quality gate failed: {msg}")
+
+    return result

@@ -36,6 +36,12 @@ def main() -> int:
 
         argv = [arg for arg in sys.argv[1:] if arg != "--headless"]
         return headless_main(argv)
+
+    if "--validate-physics" in sys.argv:
+        from solver_physics_validation import main as validate_physics_main
+
+        argv = [arg for arg in sys.argv[1:] if arg != "--validate-physics"]
+        return validate_physics_main(argv)
     return run_gui()
 
 

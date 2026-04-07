@@ -11,7 +11,8 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 from geometry_io import build_geometry_snapshot, parse_geometry
 from grim_io import export_result_to_grim
-from rcs_solver import solve_monostatic_rcs_2d
+from rcs_solver import evaluate_quality_gate, solve_monostatic_rcs_2d
+from solver_quality import evaluate_mesh_convergence, scale_snapshot_panel_density
 
 
 def _parse_list(text: str, field_name: str) -> List[float]:
@@ -98,6 +99,8 @@ def _solve_one_frequency(
     elevations_deg: List[float],
     polarization: str,
     units: str,
+    quality_thresholds: Dict[str, float | int] | None,
+    strict_quality_gate: bool,
 ) -> Dict[str, Any]:
     return solve_monostatic_rcs_2d(
         geometry_snapshot=snapshot,
@@ -106,6 +109,8 @@ def _solve_one_frequency(
         polarization=polarization,
         geometry_units=units,
         material_base_dir=base_dir,
+        quality_thresholds=quality_thresholds,
+        strict_quality_gate=strict_quality_gate,
     )
 
 
@@ -126,11 +131,20 @@ def run_headless(
     csv_output_path: str | None = None,
     history: str = "",
     quiet: bool = False,
+    quality_thresholds: Dict[str, float | int] | None = None,
+    strict_quality_gate: bool = False,
+    mesh_convergence: bool = False,
+    mesh_fine_factor: float = 1.5,
+    mesh_rms_limit_db: float = 1.0,
+    mesh_max_abs_limit_db: float = 3.0,
+    strict_mesh_convergence: bool = False,
 ) -> Dict[str, Any]:
     if any(f <= 0 for f in frequencies_ghz):
         raise ValueError("Frequencies must be positive GHz values.")
     if not elevations_deg:
         raise ValueError("At least one elevation angle is required.")
+    if mesh_convergence and float(mesh_fine_factor) <= 1.0:
+        raise ValueError("Mesh convergence requires --mesh-fine-factor > 1.0.")
 
     geo_path_abs = os.path.abspath(geometry_path)
     with open(geo_path_abs, "r") as f:
@@ -163,6 +177,8 @@ def run_headless(
             geometry_units=units,
             material_base_dir=base_dir,
             progress_callback=cb if not quiet else None,
+            quality_thresholds=quality_thresholds,
+            strict_quality_gate=strict_quality_gate,
         )
 
     if workers == 1 or len(frequencies_ghz) == 1:
@@ -187,6 +203,8 @@ def run_headless(
                         elevations_deg,
                         polarization,
                         units,
+                        quality_thresholds,
+                        strict_quality_gate,
                     ): float(freq)
                     for freq in frequencies_ghz
                 }
@@ -230,6 +248,89 @@ def run_headless(
                     "mode": "headless-multiprocess",
                 },
             }
+            md = result.get("metadata", {}) or {}
+            residual_max = 0.0
+            residual_means: List[float] = []
+            cond_max = 0.0
+            cond_means: List[float] = []
+            warning_union: List[str] = []
+            seen_warn: set[str] = set()
+            for freq in sorted(results_by_freq.keys()):
+                rmd = (results_by_freq[freq].get("metadata", {}) or {})
+                residual_max = max(residual_max, float(rmd.get("residual_norm_max", 0.0) or 0.0))
+                cond_max = max(cond_max, float(rmd.get("condition_est_max", 0.0) or 0.0))
+                residual_means.append(float(rmd.get("residual_norm_mean", 0.0) or 0.0))
+                cond_means.append(float(rmd.get("condition_est_mean", 0.0) or 0.0))
+                for msg in list(rmd.get("warnings", []) or []):
+                    text = str(msg)
+                    if text in seen_warn:
+                        continue
+                    seen_warn.add(text)
+                    warning_union.append(text)
+            md["residual_norm_max"] = float(residual_max)
+            md["residual_norm_mean"] = (
+                float(sum(residual_means) / len(residual_means)) if residual_means else 0.0
+            )
+            md["condition_est_max"] = float(cond_max)
+            md["condition_est_mean"] = (
+                float(sum(cond_means) / len(cond_means)) if cond_means else 0.0
+            )
+            md["warnings"] = warning_union
+            md["quality_gate"] = evaluate_quality_gate(md, thresholds=quality_thresholds)
+            result["metadata"] = md
+            if strict_quality_gate and not bool(md["quality_gate"].get("passed", False)):
+                msg = "; ".join(md["quality_gate"].get("violations", []) or ["quality gate failed"])
+                raise ValueError(f"Quality gate failed: {msg}")
+
+    if mesh_convergence:
+        _print(
+            (
+                "Running mesh convergence check "
+                f"(fine_factor={float(mesh_fine_factor):.3g}, "
+                f"rms_limit_db={float(mesh_rms_limit_db):.3g}, "
+                f"max_abs_limit_db={float(mesh_max_abs_limit_db):.3g})..."
+            ),
+            quiet=quiet,
+        )
+        fine_snapshot = scale_snapshot_panel_density(snapshot, float(mesh_fine_factor))
+
+        fine_last_pct = {"value": -1}
+
+        def fine_cb(done: int, total: int, message: str) -> None:
+            if quiet:
+                return
+            pct = int(round(100.0 * float(done) / float(total))) if total > 0 else 0
+            pct = max(0, min(100, pct))
+            if pct == fine_last_pct["value"] and pct not in {0, 100}:
+                return
+            fine_last_pct["value"] = pct
+            _print(f"[mesh {pct:3d}%] {message}", quiet=False)
+
+        fine_result = solve_monostatic_rcs_2d(
+            geometry_snapshot=fine_snapshot,
+            frequencies_ghz=frequencies_ghz,
+            elevations_deg=elevations_deg,
+            polarization=polarization,
+            geometry_units=units,
+            material_base_dir=base_dir,
+            progress_callback=fine_cb if not quiet else None,
+            quality_thresholds=quality_thresholds,
+            strict_quality_gate=False,
+        )
+        mesh_gate = evaluate_mesh_convergence(
+            base_result=result,
+            fine_result=fine_result,
+            rms_limit_db=float(mesh_rms_limit_db),
+            max_abs_limit_db=float(mesh_max_abs_limit_db),
+        )
+        mesh_gate["fine_factor"] = float(mesh_fine_factor)
+        md = result.get("metadata", {}) or {}
+        md["mesh_convergence"] = mesh_gate
+        result["metadata"] = md
+
+        if strict_mesh_convergence and not bool(mesh_gate.get("passed", False)):
+            reason = str(mesh_gate.get("reason", "") or "mesh convergence failed")
+            raise ValueError(f"Mesh convergence gate failed: {reason}")
 
     grim_files = export_result_to_grim(
         result,
@@ -313,9 +414,60 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--history", default="", help="Optional history string stored in .grim metadata.")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress logs.")
     parser.add_argument(
+        "--strict-quality",
+        action="store_true",
+        help="Fail the run if numeric quality gate thresholds are exceeded.",
+    )
+    parser.add_argument(
+        "--quality-residual-max",
+        type=float,
+        default=1.0e-2,
+        help="Quality gate threshold for metadata.residual_norm_max.",
+    )
+    parser.add_argument(
+        "--quality-condition-max",
+        type=float,
+        default=1.0e6,
+        help="Quality gate threshold for metadata.condition_est_max.",
+    )
+    parser.add_argument(
+        "--quality-warnings-max",
+        type=int,
+        default=10,
+        help="Quality gate threshold for number of metadata warnings.",
+    )
+    parser.add_argument(
         "--json-summary",
         default="",
         help="Optional JSON summary path with metadata and output file paths.",
+    )
+    parser.add_argument(
+        "--mesh-convergence",
+        action="store_true",
+        help="Run a fine-mesh solve and compare dB deltas against the base solve.",
+    )
+    parser.add_argument(
+        "--strict-mesh-convergence",
+        action="store_true",
+        help="Fail the run if mesh convergence criteria are not met.",
+    )
+    parser.add_argument(
+        "--mesh-fine-factor",
+        type=float,
+        default=1.5,
+        help="Multiplier applied to geometry n-property for fine-mesh convergence solve.",
+    )
+    parser.add_argument(
+        "--mesh-rms-max-db",
+        type=float,
+        default=1.0,
+        help="Mesh convergence threshold for RMS(|base_dB - fine_dB|).",
+    )
+    parser.add_argument(
+        "--mesh-max-abs-max-db",
+        type=float,
+        default=3.0,
+        help="Mesh convergence threshold for max abs dB delta.",
     )
     return parser
 
@@ -363,6 +515,17 @@ def main(argv: List[str] | None = None) -> int:
         csv_output_path=(args.csv_output.strip() or None),
         history=args.history,
         quiet=bool(args.quiet),
+        quality_thresholds={
+            "residual_norm_max": float(args.quality_residual_max),
+            "condition_est_max": float(args.quality_condition_max),
+            "warnings_max": int(args.quality_warnings_max),
+        },
+        strict_quality_gate=bool(args.strict_quality),
+        mesh_convergence=bool(args.mesh_convergence),
+        mesh_fine_factor=float(args.mesh_fine_factor),
+        mesh_rms_limit_db=float(args.mesh_rms_max_db),
+        mesh_max_abs_limit_db=float(args.mesh_max_abs_max_db),
+        strict_mesh_convergence=bool(args.strict_mesh_convergence),
     )
 
     summary = {

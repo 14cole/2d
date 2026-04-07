@@ -1,3 +1,20 @@
+"""
+Solver UI threshold guide.
+
+Quality gate inputs:
+- `residual <=`: max allowed linear solve residual norm (dimensionless).
+- `cond <=`: max allowed condition-number estimate of the system matrix (dimensionless).
+- `warns <=`: max allowed warning count emitted by the solver.
+- `Require quality gate pass`: fail the solve if any quality threshold is exceeded.
+
+Mesh convergence inputs:
+- `fine factor`: panel-density multiplier for the fine mesh solve (`> 1.0`).
+- `rms dB <=`: max allowed RMS of `(base_rcs_db - fine_rcs_db)` over all sample points.
+- `max |dB| <=`: max allowed worst-case absolute dB delta between base and fine solves.
+- `Run mesh convergence check`: execute the additional fine-mesh solve and compute deltas.
+- `Require mesh convergence pass`: fail the solve if mesh thresholds are exceeded.
+"""
+
 import math
 import os
 import re
@@ -32,6 +49,7 @@ from matplotlib.figure import Figure
 from geometry_io import build_geometry_snapshot, parse_geometry
 from grim_io import export_result_to_grim
 from rcs_solver import solve_monostatic_rcs_2d
+from solver_quality import evaluate_mesh_convergence, scale_snapshot_panel_density
 
 
 class MplCanvas(FigureCanvas):
@@ -58,6 +76,13 @@ class _SolveWorker(QObject):
         elevations: List[float],
         pol: str,
         units: str,
+        quality_thresholds: Dict[str, float | int],
+        strict_quality_gate: bool,
+        mesh_convergence: bool,
+        mesh_fine_factor: float,
+        mesh_rms_limit_db: float,
+        mesh_max_abs_limit_db: float,
+        strict_mesh_convergence: bool,
     ):
         super().__init__()
         self.snapshot = snapshot
@@ -67,6 +92,13 @@ class _SolveWorker(QObject):
         self.elevations = elevations
         self.pol = pol
         self.units = units
+        self.quality_thresholds = dict(quality_thresholds)
+        self.strict_quality_gate = strict_quality_gate
+        self.mesh_convergence = bool(mesh_convergence)
+        self.mesh_fine_factor = float(mesh_fine_factor)
+        self.mesh_rms_limit_db = float(mesh_rms_limit_db)
+        self.mesh_max_abs_limit_db = float(mesh_max_abs_limit_db)
+        self.strict_mesh_convergence = bool(strict_mesh_convergence)
 
     def _on_progress(self, done_steps: int, total_steps: int, message: str) -> None:
         if total_steps <= 0:
@@ -79,15 +111,77 @@ class _SolveWorker(QObject):
     @Slot()
     def run(self):
         try:
-            result = solve_monostatic_rcs_2d(
-                geometry_snapshot=self.snapshot,
-                frequencies_ghz=self.frequencies,
-                elevations_deg=self.elevations,
-                polarization=self.pol,
-                geometry_units=self.units,
-                material_base_dir=self.base_dir,
-                progress_callback=self._on_progress,
-            )
+            if self.mesh_convergence:
+                base_progress_scale = 0.6
+
+                def base_cb(done_steps: int, total_steps: int, message: str) -> None:
+                    if total_steps <= 0:
+                        pct = 0
+                    else:
+                        pct = int(round(base_progress_scale * 100.0 * float(done_steps) / float(total_steps)))
+                    pct = max(0, min(60, pct))
+                    self.progress.emit(pct, message)
+
+                result = solve_monostatic_rcs_2d(
+                    geometry_snapshot=self.snapshot,
+                    frequencies_ghz=self.frequencies,
+                    elevations_deg=self.elevations,
+                    polarization=self.pol,
+                    geometry_units=self.units,
+                    material_base_dir=self.base_dir,
+                    progress_callback=base_cb,
+                    quality_thresholds=self.quality_thresholds,
+                    strict_quality_gate=self.strict_quality_gate,
+                )
+                self.progress.emit(61, "Running mesh convergence fine-mesh solve...")
+                fine_snapshot = scale_snapshot_panel_density(self.snapshot, self.mesh_fine_factor)
+
+                def fine_cb(done_steps: int, total_steps: int, message: str) -> None:
+                    if total_steps <= 0:
+                        pct = 60
+                    else:
+                        frac = 0.4 * float(done_steps) / float(total_steps)
+                        pct = 60 + int(round(100.0 * frac))
+                    pct = max(60, min(100, pct))
+                    self.progress.emit(pct, f"Mesh check: {message}")
+
+                fine_result = solve_monostatic_rcs_2d(
+                    geometry_snapshot=fine_snapshot,
+                    frequencies_ghz=self.frequencies,
+                    elevations_deg=self.elevations,
+                    polarization=self.pol,
+                    geometry_units=self.units,
+                    material_base_dir=self.base_dir,
+                    progress_callback=fine_cb,
+                    quality_thresholds=self.quality_thresholds,
+                    strict_quality_gate=False,
+                )
+                mesh_gate = evaluate_mesh_convergence(
+                    base_result=result,
+                    fine_result=fine_result,
+                    rms_limit_db=self.mesh_rms_limit_db,
+                    max_abs_limit_db=self.mesh_max_abs_limit_db,
+                )
+                mesh_gate["fine_factor"] = self.mesh_fine_factor
+                metadata = dict(result.get("metadata", {}) or {})
+                metadata["mesh_convergence"] = mesh_gate
+                result["metadata"] = metadata
+
+                if self.strict_mesh_convergence and not bool(mesh_gate.get("passed", False)):
+                    reason = str(mesh_gate.get("reason", "") or "mesh convergence failed")
+                    raise ValueError(f"Mesh convergence gate failed: {reason}")
+            else:
+                result = solve_monostatic_rcs_2d(
+                    geometry_snapshot=self.snapshot,
+                    frequencies_ghz=self.frequencies,
+                    elevations_deg=self.elevations,
+                    polarization=self.pol,
+                    geometry_units=self.units,
+                    material_base_dir=self.base_dir,
+                    progress_callback=self._on_progress,
+                    quality_thresholds=self.quality_thresholds,
+                    strict_quality_gate=self.strict_quality_gate,
+                )
         except Exception as exc:
             self.error.emit(str(exc))
             return
@@ -143,6 +237,37 @@ class SolverTab(QWidget):
         self.cmb_pol = QComboBox()
         self.cmb_pol.addItem("TE (vertical / VV)", userData="TE")
         self.cmb_pol.addItem("TM (horizontal / HH)", userData="TM")
+        self.chk_strict_quality = QCheckBox("Require quality gate pass")
+        self.chk_strict_quality.setChecked(False)
+        self.edit_quality_residual_max = QLineEdit("1e-2")
+        self.edit_quality_condition_max = QLineEdit("1e6")
+        self.edit_quality_warnings_max = QLineEdit("10")
+        quality_threshold_row = QWidget()
+        quality_threshold_layout = QHBoxLayout(quality_threshold_row)
+        quality_threshold_layout.setContentsMargins(0, 0, 0, 0)
+        quality_threshold_layout.addWidget(QLabel("residual<="))
+        quality_threshold_layout.addWidget(self.edit_quality_residual_max)
+        quality_threshold_layout.addWidget(QLabel("cond<="))
+        quality_threshold_layout.addWidget(self.edit_quality_condition_max)
+        quality_threshold_layout.addWidget(QLabel("warns<="))
+        quality_threshold_layout.addWidget(self.edit_quality_warnings_max)
+
+        self.chk_mesh_convergence = QCheckBox("Run mesh convergence check")
+        self.chk_mesh_convergence.setChecked(False)
+        self.chk_strict_mesh = QCheckBox("Require mesh convergence pass")
+        self.chk_strict_mesh.setChecked(False)
+        self.edit_mesh_fine_factor = QLineEdit("1.5")
+        self.edit_mesh_rms_max_db = QLineEdit("1.0")
+        self.edit_mesh_max_abs_max_db = QLineEdit("3.0")
+        mesh_threshold_row = QWidget()
+        mesh_threshold_layout = QHBoxLayout(mesh_threshold_row)
+        mesh_threshold_layout.setContentsMargins(0, 0, 0, 0)
+        mesh_threshold_layout.addWidget(QLabel("fine factor"))
+        mesh_threshold_layout.addWidget(self.edit_mesh_fine_factor)
+        mesh_threshold_layout.addWidget(QLabel("rms dB<="))
+        mesh_threshold_layout.addWidget(self.edit_mesh_rms_max_db)
+        mesh_threshold_layout.addWidget(QLabel("max |dB|<="))
+        mesh_threshold_layout.addWidget(self.edit_mesh_max_abs_max_db)
 
         self.cmb_freq_mode = QComboBox()
         self.cmb_freq_mode.addItems(["Discrete List", "Start / Stop / Step"])
@@ -180,6 +305,11 @@ class SolverTab(QWidget):
 
         options_form.addRow("Units In Geometry", self.cmb_units)
         options_form.addRow("Polarization", self.cmb_pol)
+        options_form.addRow("Quality Gate", self.chk_strict_quality)
+        options_form.addRow("Quality Thresholds", quality_threshold_row)
+        options_form.addRow("Mesh Check", self.chk_mesh_convergence)
+        options_form.addRow("Mesh Strict", self.chk_strict_mesh)
+        options_form.addRow("Mesh Thresholds", mesh_threshold_row)
         options_form.addRow("Frequency Mode", self.cmb_freq_mode)
         options_form.addRow("Frequencies (GHz)", self.edit_freq_list)
         options_form.addRow("Frequency Sweep", freq_sweep_row)
@@ -398,6 +528,15 @@ class SolverTab(QWidget):
         self.edit_elev_stop.setEnabled(not solving and self.cmb_elev_mode.currentIndex() != 0)
         self.edit_elev_step.setEnabled(not solving and self.cmb_elev_mode.currentIndex() != 0)
         self.chk_export_after_solve.setEnabled(not solving)
+        self.chk_strict_quality.setEnabled(not solving)
+        self.edit_quality_residual_max.setEnabled(not solving)
+        self.edit_quality_condition_max.setEnabled(not solving)
+        self.edit_quality_warnings_max.setEnabled(not solving)
+        self.chk_mesh_convergence.setEnabled(not solving)
+        self.chk_strict_mesh.setEnabled(not solving)
+        self.edit_mesh_fine_factor.setEnabled(not solving)
+        self.edit_mesh_rms_max_db.setEnabled(not solving)
+        self.edit_mesh_max_abs_max_db.setEnabled(not solving)
         self.btn_run.setText("Solving..." if solving else "Run Monostatic Solver")
 
     @Slot(int, str)
@@ -422,8 +561,31 @@ class SolverTab(QWidget):
             f"Solved monostatic 2D RCS with {freq_count} frequency(ies) and "
             f"{elev_count} elevation angle(s)."
         )
+        qg = metadata.get("quality_gate", {}) or {}
+        quality_suffix = ""
+        if isinstance(qg, dict):
+            if bool(qg.get("passed", True)):
+                quality_suffix = " Quality gate: PASS."
+            else:
+                violations = qg.get("violations", []) or []
+                joined = "; ".join(str(v) for v in violations[:2])
+                if len(violations) > 2:
+                    joined += f" (+{len(violations) - 2} more)"
+                quality_suffix = f" Quality gate: FAIL ({joined})."
+        mesh_suffix = ""
+        mesh = metadata.get("mesh_convergence", {}) or {}
+        if isinstance(mesh, dict) and bool(mesh.get("enabled", False)):
+            if bool(mesh.get("passed", False)):
+                mesh_suffix = (
+                    " Mesh convergence: PASS "
+                    f"(rms={float(mesh.get('rms_db', 0.0)):.3g} dB, "
+                    f"max={float(mesh.get('max_abs_db', 0.0)):.3g} dB)."
+                )
+            else:
+                reason = str(mesh.get("reason", "") or "criteria not met")
+                mesh_suffix = f" Mesh convergence: FAIL ({reason})."
         self.progress.setValue(100)
-        self.lbl_status.setText(write_summary)
+        self.lbl_status.setText(write_summary + quality_suffix + mesh_suffix)
 
         if self.chk_export_after_solve.isChecked():
             try:
@@ -442,7 +604,11 @@ class SolverTab(QWidget):
                     ),
                 )
                 self.lbl_status.setText(
-                    write_summary + " Exported " + ", ".join(os.path.basename(path) for path in files)
+                    write_summary
+                    + quality_suffix
+                    + mesh_suffix
+                    + " Exported "
+                    + ", ".join(os.path.basename(path) for path in files)
                 )
             except Exception as exc:
                 QMessageBox.warning(self, "Export Warning", f"Solve completed, but export failed:\n{exc}")
@@ -470,6 +636,33 @@ class SolverTab(QWidget):
             snapshot, source_path, base_dir = self._load_geometry_for_solver()
             pol = str(self.cmb_pol.currentData())
             units = self.cmb_units.currentText()
+            strict_quality = bool(self.chk_strict_quality.isChecked())
+            quality_residual_max = float(self.edit_quality_residual_max.text().strip())
+            quality_condition_max = float(self.edit_quality_condition_max.text().strip())
+            quality_warnings_max = int(float(self.edit_quality_warnings_max.text().strip()))
+            if quality_residual_max <= 0.0:
+                raise ValueError("Quality residual threshold must be > 0.")
+            if quality_condition_max <= 0.0:
+                raise ValueError("Quality condition threshold must be > 0.")
+            if quality_warnings_max < 0:
+                raise ValueError("Quality warning threshold must be >= 0.")
+            quality_thresholds: Dict[str, float | int] = {
+                "residual_norm_max": quality_residual_max,
+                "condition_est_max": quality_condition_max,
+                "warnings_max": quality_warnings_max,
+            }
+
+            mesh_convergence = bool(self.chk_mesh_convergence.isChecked())
+            strict_mesh_convergence = bool(self.chk_strict_mesh.isChecked())
+            mesh_fine_factor = float(self.edit_mesh_fine_factor.text().strip())
+            mesh_rms_limit_db = float(self.edit_mesh_rms_max_db.text().strip())
+            mesh_max_abs_limit_db = float(self.edit_mesh_max_abs_max_db.text().strip())
+            if mesh_convergence and mesh_fine_factor <= 1.0:
+                raise ValueError("Mesh convergence requires fine factor > 1.0.")
+            if mesh_rms_limit_db <= 0.0:
+                raise ValueError("Mesh RMS threshold must be > 0.")
+            if mesh_max_abs_limit_db <= 0.0:
+                raise ValueError("Mesh max-abs threshold must be > 0.")
         except Exception as exc:
             QMessageBox.critical(self, "Solver Error", str(exc))
             self.lbl_status.setText(f"Solve failed: {exc}")
@@ -488,6 +681,13 @@ class SolverTab(QWidget):
             elevations=elevations,
             pol=pol,
             units=units,
+            quality_thresholds=quality_thresholds,
+            strict_quality_gate=strict_quality,
+            mesh_convergence=mesh_convergence,
+            mesh_fine_factor=mesh_fine_factor,
+            mesh_rms_limit_db=mesh_rms_limit_db,
+            mesh_max_abs_limit_db=mesh_max_abs_limit_db,
+            strict_mesh_convergence=strict_mesh_convergence,
         )
         worker.moveToThread(thread)
 

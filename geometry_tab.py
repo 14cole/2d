@@ -528,6 +528,61 @@ class GeometryTab(QWidget):
                 return path
         return ""
 
+    def _point_key(self, x: float, y: float, tol: float) -> Tuple[int, int]:
+        inv = 1.0 / max(tol, 1e-12)
+        return int(round(float(x) * inv)), int(round(float(y) * inv))
+
+    def _segments_intersect(
+        self,
+        a1: Tuple[float, float],
+        a2: Tuple[float, float],
+        b1: Tuple[float, float],
+        b2: Tuple[float, float],
+        tol: float,
+    ) -> bool:
+        ax1, ay1 = a1
+        ax2, ay2 = a2
+        bx1, by1 = b1
+        bx2, by2 = b2
+
+        min_ax, max_ax = min(ax1, ax2), max(ax1, ax2)
+        min_ay, max_ay = min(ay1, ay2), max(ay1, ay2)
+        min_bx, max_bx = min(bx1, bx2), max(bx1, bx2)
+        min_by, max_by = min(by1, by2), max(by1, by2)
+        if max_ax < min_bx - tol or max_bx < min_ax - tol:
+            return False
+        if max_ay < min_by - tol or max_by < min_ay - tol:
+            return False
+
+        def orient(px: float, py: float, qx: float, qy: float, rx: float, ry: float) -> float:
+            return (qx - px) * (ry - py) - (qy - py) * (rx - px)
+
+        def on_seg(px: float, py: float, qx: float, qy: float, rx: float, ry: float) -> bool:
+            return (
+                min(px, qx) - tol <= rx <= max(px, qx) + tol
+                and min(py, qy) - tol <= ry <= max(py, qy) + tol
+            )
+
+        o1 = orient(ax1, ay1, ax2, ay2, bx1, by1)
+        o2 = orient(ax1, ay1, ax2, ay2, bx2, by2)
+        o3 = orient(bx1, by1, bx2, by2, ax1, ay1)
+        o4 = orient(bx1, by1, bx2, by2, ax2, ay2)
+
+        if (o1 > tol and o2 < -tol or o1 < -tol and o2 > tol) and (
+            o3 > tol and o4 < -tol or o3 < -tol and o4 > tol
+        ):
+            return True
+
+        if abs(o1) <= tol and on_seg(ax1, ay1, ax2, ay2, bx1, by1):
+            return True
+        if abs(o2) <= tol and on_seg(ax1, ay1, ax2, ay2, bx2, by2):
+            return True
+        if abs(o3) <= tol and on_seg(bx1, by1, bx2, by2, ax1, ay1):
+            return True
+        if abs(o4) <= tol and on_seg(bx1, by1, bx2, by2, ax2, ay2):
+            return True
+        return False
+
     def validate_geometry(self):
         ibcs_rows = self._read_small_table(self.table_ibc)
         dielectric_rows = self._read_small_table(self.table_diel)
@@ -641,6 +696,94 @@ class GeometryTab(QWidget):
             if seg_type in {1, 2, 3, 4} and ipn2 != 0:
                 findings.append(("WARN", row, f"{label}: TYPE {seg_type} typically uses IPN2=0."))
                 issue_rows.add(row)
+
+        # Global topology checks across segments (not just within each row).
+        global_primitives: List[Tuple[int, int, Tuple[float, float, float, float], str]] = []
+        row_type: Dict[int, int] = {}
+        for row, seg in enumerate(self.segments):
+            props = self._ensure_prop_len(seg.properties, 6)
+            seg_type = self._parse_int_token(props[0], -1)
+            row_type[row] = seg_type
+            for pidx, prim in enumerate(self._segment_primitives(seg)):
+                global_primitives.append((row, pidx, prim, seg.name))
+
+        endpoint_hits: Dict[Tuple[int, int], List[Tuple[int, int, int]]] = {}
+        for row, pidx, (x1, y1, x2, y2), _name in global_primitives:
+            k1 = self._point_key(x1, y1, tol)
+            k2 = self._point_key(x2, y2, tol)
+            endpoint_hits.setdefault(k1, []).append((row, pidx, 0))
+            endpoint_hits.setdefault(k2, []).append((row, pidx, 1))
+
+        for _key, hits in endpoint_hits.items():
+            incident_rows = sorted({h[0] for h in hits})
+            if len(hits) == 1:
+                row = hits[0][0]
+                if row_type.get(row, -1) in {2, 3, 4, 5}:
+                    findings.append(
+                        ("WARN", row, f"Row {row + 1}: dangling endpoint not connected to any other primitive.")
+                    )
+                    issue_rows.add(row)
+            if len(hits) > 6:
+                row = incident_rows[0]
+                findings.append(
+                    (
+                        "WARN",
+                        row,
+                        f"Row {row + 1}: high-degree node with {len(hits)} incident primitive endpoints "
+                        "(possible non-manifold junction).",
+                    )
+                )
+                issue_rows.add(row)
+
+        max_intersections = 30
+        found_intersections = 0
+        n_prims = len(global_primitives)
+        stop_intersections = False
+        for i in range(n_prims):
+            if stop_intersections:
+                break
+            row_i, pidx_i, prim_i, name_i = global_primitives[i]
+            x1, y1, x2, y2 = prim_i
+            k_i0 = self._point_key(x1, y1, tol)
+            k_i1 = self._point_key(x2, y2, tol)
+            for j in range(i + 1, n_prims):
+                row_j, pidx_j, prim_j, name_j = global_primitives[j]
+                u1, v1, u2, v2 = prim_j
+                k_j0 = self._point_key(u1, v1, tol)
+                k_j1 = self._point_key(u2, v2, tol)
+
+                shared_endpoint = k_i0 in {k_j0, k_j1} or k_i1 in {k_j0, k_j1}
+                if shared_endpoint:
+                    continue
+                if row_i == row_j and abs(pidx_i - pidx_j) <= 1:
+                    continue
+
+                if not self._segments_intersect((x1, y1), (x2, y2), (u1, v1), (u2, v2), tol):
+                    continue
+
+                findings.append(
+                    (
+                        "ERROR",
+                        row_i,
+                        (
+                            f"Rows {row_i + 1} ('{name_i}') and {row_j + 1} ('{name_j}') have a non-endpoint "
+                            "primitive intersection."
+                        ),
+                    )
+                )
+                issue_rows.add(row_i)
+                issue_rows.add(row_j)
+                found_intersections += 1
+                if found_intersections >= max_intersections:
+                    findings.append(
+                        (
+                            "WARN",
+                            row_i,
+                            f"Intersection reporting truncated after {max_intersections} findings.",
+                        )
+                    )
+                    stop_intersections = True
+                    break
 
         self.issue_rows = issue_rows
         self._refresh_segment_styles()
