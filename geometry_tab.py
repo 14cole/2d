@@ -490,8 +490,8 @@ class GeometryTab(QWidget):
                 length = (dx * dx + dy * dy) ** 0.5
                 if length <= 1e-12:
                     continue
-                nx = dy / length
-                ny = -dx / length
+                nx = -dy / length
+                ny = dx / length
                 mx = 0.5 * (x1 + x2)
                 my = 0.5 * (y1 + y2)
                 ann = ax.annotate(
@@ -597,9 +597,9 @@ class GeometryTab(QWidget):
                     area2 += x0 * y1 - x1 * y0
                 orient = "CCW" if area2 > 0 else "CW"
                 findings.append(("INFO", row, f"{label}: closed chain, orientation {orient}."))
-                if seg_type in {2, 3, 4, 5} and area2 < 0:
+                if seg_type in {2, 3, 4, 5} and area2 > 0:
                     findings.append(
-                        ("WARN", row, f"{label}: CW orientation may mean inward-pointing normals; verify direction.")
+                        ("WARN", row, f"{label}: CCW orientation may mean inward-pointing normals; verify direction.")
                     )
                     issue_rows.add(row)
             else:

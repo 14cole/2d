@@ -944,16 +944,18 @@ def _build_coupled_panel_info(
         if seg_type == 3:
             if panel.ipn1 <= 0:
                 raise ValueError(f"TYPE 3 panel '{panel.name}' requires IPN1 > 0.")
-            minus_region = 0
-            plus_region = panel.ipn1
+            # Convention: IPN1 is the "minus/opposite-normal" side.
+            minus_region = panel.ipn1
+            plus_region = 0
             bc_kind = "transmission"
-            minus_has_incident = True
-            plus_has_incident = False
+            minus_has_incident = False
+            plus_has_incident = True
         elif seg_type == 5:
             if panel.ipn1 <= 0 or panel.ipn2 <= 0:
                 raise ValueError(f"TYPE 5 panel '{panel.name}' requires IPN1 > 0 and IPN2 > 0.")
-            minus_region = panel.ipn2
-            plus_region = panel.ipn1
+            # Convention: IPN1 on minus side, IPN2 on plus side.
+            minus_region = panel.ipn1
+            plus_region = panel.ipn2
             bc_kind = "transmission"
             minus_has_incident = False
             plus_has_incident = False
