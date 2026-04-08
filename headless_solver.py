@@ -101,6 +101,10 @@ def _solve_one_frequency(
     units: str,
     quality_thresholds: Dict[str, float | int] | None,
     strict_quality_gate: bool,
+    compute_condition_number: bool,
+    parallel_elevations: bool,
+    max_elevation_workers: int,
+    reuse_angle_invariant_matrix: bool,
 ) -> Dict[str, Any]:
     return solve_monostatic_rcs_2d(
         geometry_snapshot=snapshot,
@@ -111,6 +115,10 @@ def _solve_one_frequency(
         material_base_dir=base_dir,
         quality_thresholds=quality_thresholds,
         strict_quality_gate=strict_quality_gate,
+        compute_condition_number=compute_condition_number,
+        parallel_elevations=parallel_elevations,
+        max_elevation_workers=max_elevation_workers,
+        reuse_angle_invariant_matrix=reuse_angle_invariant_matrix,
     )
 
 
@@ -138,6 +146,10 @@ def run_headless(
     mesh_rms_limit_db: float = 1.0,
     mesh_max_abs_limit_db: float = 3.0,
     strict_mesh_convergence: bool = False,
+    compute_condition_number: bool | None = None,
+    parallel_elevations: bool = True,
+    max_elevation_workers: int = 0,
+    reuse_angle_invariant_matrix: bool = True,
 ) -> Dict[str, Any]:
     if any(f <= 0 for f in frequencies_ghz):
         raise ValueError("Frequencies must be positive GHz values.")
@@ -145,6 +157,7 @@ def run_headless(
         raise ValueError("At least one elevation angle is required.")
     if mesh_convergence and float(mesh_fine_factor) <= 1.0:
         raise ValueError("Mesh convergence requires --mesh-fine-factor > 1.0.")
+    compute_cond = bool(strict_quality_gate) if compute_condition_number is None else bool(compute_condition_number)
 
     geo_path_abs = os.path.abspath(geometry_path)
     with open(geo_path_abs, "r") as f:
@@ -179,6 +192,10 @@ def run_headless(
             progress_callback=cb if not quiet else None,
             quality_thresholds=quality_thresholds,
             strict_quality_gate=strict_quality_gate,
+            compute_condition_number=compute_cond,
+            parallel_elevations=parallel_elevations,
+            max_elevation_workers=max_elevation_workers,
+            reuse_angle_invariant_matrix=reuse_angle_invariant_matrix,
         )
 
     if workers == 1 or len(frequencies_ghz) == 1:
@@ -205,6 +222,10 @@ def run_headless(
                         units,
                         quality_thresholds,
                         strict_quality_gate,
+                        compute_cond,
+                        parallel_elevations,
+                        max_elevation_workers,
+                        reuse_angle_invariant_matrix,
                     ): float(freq)
                     for freq in frequencies_ghz
                 }
@@ -316,6 +337,10 @@ def run_headless(
             progress_callback=fine_cb if not quiet else None,
             quality_thresholds=quality_thresholds,
             strict_quality_gate=False,
+            compute_condition_number=False,
+            parallel_elevations=parallel_elevations,
+            max_elevation_workers=max_elevation_workers,
+            reuse_angle_invariant_matrix=reuse_angle_invariant_matrix,
         )
         mesh_gate = evaluate_mesh_convergence(
             base_result=result,
@@ -437,6 +462,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Quality gate threshold for number of metadata warnings.",
     )
     parser.add_argument(
+        "--compute-condition-number",
+        action="store_true",
+        help="Force condition-number computation (auto-enabled by --strict-quality).",
+    )
+    parser.add_argument(
+        "--no-parallel-elevations",
+        action="store_true",
+        help="Disable per-elevation parallel execution inside each frequency solve.",
+    )
+    parser.add_argument(
+        "--max-elevation-workers",
+        type=int,
+        default=0,
+        help="Max workers for per-elevation parallelism (0 = auto).",
+    )
+    parser.add_argument(
+        "--no-matrix-reuse",
+        action="store_true",
+        help="Disable angle-invariant matrix/factorization reuse optimization.",
+    )
+    parser.add_argument(
         "--json-summary",
         default="",
         help="Optional JSON summary path with metadata and output file paths.",
@@ -526,6 +572,10 @@ def main(argv: List[str] | None = None) -> int:
         mesh_rms_limit_db=float(args.mesh_rms_max_db),
         mesh_max_abs_limit_db=float(args.mesh_max_abs_max_db),
         strict_mesh_convergence=bool(args.strict_mesh_convergence),
+        compute_condition_number=(True if bool(args.compute_condition_number) else None),
+        parallel_elevations=not bool(args.no_parallel_elevations),
+        max_elevation_workers=max(0, int(args.max_elevation_workers)),
+        reuse_angle_invariant_matrix=not bool(args.no_matrix_reuse),
     )
 
     summary = {

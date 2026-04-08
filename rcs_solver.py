@@ -18,6 +18,7 @@ Notes:
 """
 
 import cmath
+import concurrent.futures
 import ctypes
 import ctypes.util
 import math
@@ -30,6 +31,10 @@ try:
     from scipy import special as _SCIPY_SPECIAL
 except Exception:
     _SCIPY_SPECIAL = None
+try:
+    from scipy import linalg as _SCIPY_LINALG
+except Exception:
+    _SCIPY_LINALG = None
 
 try:
     import mpmath as _MPMATH
@@ -41,6 +46,7 @@ ETA0 = 376.730313668
 EPS = 1e-12
 EULER_GAMMA = 0.5772156649015329
 CFIE_EPS = 1e-3
+MAX_PANELS_DEFAULT = 20_000
 
 
 @dataclass
@@ -117,6 +123,16 @@ class MediumTable:
         mu_r = np.interp(freq_ghz, self.freqs_ghz, self.mu_values.real)
         mu_i = np.interp(freq_ghz, self.freqs_ghz, self.mu_values.imag)
         return complex(eps_r, eps_i), complex(mu_r, mu_i)
+
+
+@dataclass
+class PreparedLinearSolver:
+    """Reusable linear-solve handle for repeated Ax=b with fixed A."""
+
+    a_mat: np.ndarray
+    method: str
+    lu: np.ndarray | None = None
+    piv: np.ndarray | None = None
 
 
 class MaterialLibrary:
@@ -691,6 +707,7 @@ def _build_panels(
     geometry_snapshot: Dict[str, Any],
     meters_scale: float,
     min_wavelength: float,
+    max_panels: int = MAX_PANELS_DEFAULT,
 ) -> List[Panel]:
     """
     Discretize all geometry primitives into collocation panels with oriented normals.
@@ -754,9 +771,11 @@ def _build_panels(
 
     if not panels:
         raise ValueError("Geometry does not contain any valid discretized panels.")
-    if len(panels) > 2500:
+    max_allowed = max(1, int(max_panels))
+    if len(panels) > max_allowed:
         raise ValueError(
-            f"Discretization produced {len(panels)} panels; reduce n or frequency range for this implementation."
+            f"Discretization produced {len(panels)} panels; limit is {max_allowed}. "
+            "Reduce n/frequency range or increase max_panels."
         )
     return panels
 
@@ -1100,16 +1119,91 @@ def _get_quadrature(order: int) -> Tuple[np.ndarray, np.ndarray]:
     return _QUAD_CACHE[o]
 
 
-def _single_layer_self_term(k0: complex | float, panel_length: float) -> complex:
-    """Analytic small-argument self-term correction for pulse-basis diagonal."""
+def _near_singular_scheme(distance: float, panel_length: float) -> Tuple[int, int]:
+    """
+    Choose quadrature order and source-panel subdivision count.
 
-    # Analytic principal-value style correction for pulse-point self term on a straight panel.
-    # Integral of (j/4)H0^(2)(k|s|) over s in [-L/2, L/2], using small-argument asymptotic.
+    This improves near-singular accuracy when observation points approach a panel.
+    """
+
+    ratio = float(distance) / max(float(panel_length), EPS)
+    if ratio < 0.25:
+        return 64, 16
+    if ratio < 0.60:
+        return 56, 10
+    if ratio < 1.50:
+        return 40, 6
+    if ratio < 3.00:
+        return 28, 3
+    return 16, 1
+
+
+def _integrate_panel_generic(
+    obs: np.ndarray,
+    src: Panel,
+    kernel_eval: Callable[[np.ndarray, np.ndarray], complex],
+) -> complex:
+    seg = src.p1 - src.p0
+    distance = float(np.linalg.norm(obs - src.center))
+    order, splits = _near_singular_scheme(distance, src.length)
+    qt, qw = _get_quadrature(order)
+
+    acc = 0.0 + 0.0j
+    inv_splits = 1.0 / float(splits)
+    for sidx in range(splits):
+        t0 = float(sidx) * inv_splits
+        dt = inv_splits
+        for t, w in zip(qt, qw):
+            u = t0 + dt * float(t)
+            rp = src.p0 + u * seg
+            acc += (dt * float(w)) * kernel_eval(obs, rp)
+    return acc * src.length
+
+
+def _single_layer_self_term(k0: complex | float, panel_length: float) -> complex:
+    """
+    Self-term for pulse-basis diagonal using singularity subtraction + correction.
+
+    Base asymptotic piece is analytic; remainder is integrated numerically so this
+    remains accurate beyond the small-argument regime.
+    """
+
     l = max(float(panel_length), EPS)
-    x = complex(k0) * l / 4.0
+    kz = complex(k0)
+    x = kz * l / 4.0
     if abs(x) <= 1e-12:
         x = 1e-12 + 0.0j
-    return (l / (2.0 * math.pi)) * (cmath.log(x) + EULER_GAMMA - 1.0) + 0.25j * l
+    asym = (l / (2.0 * math.pi)) * (cmath.log(x) + EULER_GAMMA - 1.0) + 0.25j * l
+
+    # Correction integral for finite kL effects:
+    # 2 * ∫_0^{L/2} [G(r) - G_asym(r)] dr
+    a = 0.5 * l
+    kl = abs(kz) * l
+    if kl < 0.5:
+        order, splits = 24, 6
+    elif kl < 3.0:
+        order, splits = 36, 8
+    elif kl < 10.0:
+        order, splits = 48, 12
+    else:
+        order, splits = 64, 16
+
+    qt, qw = _get_quadrature(order)
+    corr_pos = 0.0 + 0.0j
+    inv_splits = 1.0 / float(splits)
+    for sidx in range(splits):
+        r0 = a * float(sidx) * inv_splits
+        dr = a * inv_splits
+        for t, w in zip(qt, qw):
+            r = r0 + dr * float(t)
+            g = _green_2d(k0, r)
+            z = kz * max(r, EPS) / 2.0
+            if abs(z) <= 1e-12:
+                z = 1e-12 + 0.0j
+            g_asym = (1.0 / (2.0 * math.pi)) * (cmath.log(z) + EULER_GAMMA) + 0.25j
+            corr_pos += dr * float(w) * (g - g_asym)
+
+    return asym + 2.0 * corr_pos
 
 
 def _integrate_single_layer(obs: np.ndarray, src: Panel, k0: complex | float, is_self: bool) -> complex:
@@ -1117,22 +1211,11 @@ def _integrate_single_layer(obs: np.ndarray, src: Panel, k0: complex | float, is
 
     if is_self:
         return _single_layer_self_term(k0, src.length)
-
-    seg = src.p1 - src.p0
-    acc = 0.0 + 0.0j
-    distance = float(np.linalg.norm(obs - src.center))
-    ratio = distance / max(src.length, EPS)
-    order = 10
-    if ratio < 2.0:
-        order = 24
-    if ratio < 0.6:
-        order = 48
-    qt, qw = _get_quadrature(order)
-    for t, w in zip(qt, qw):
-        rp = src.p0 + t * seg
-        r = float(np.linalg.norm(obs - rp))
-        acc += w * _green_2d(k0, r)
-    return acc * src.length
+    return _integrate_panel_generic(
+        obs,
+        src,
+        lambda o, rp: _green_2d(k0, float(np.linalg.norm(o - rp))),
+    )
 
 
 def _integrate_kprime(obs: np.ndarray, n_obs: np.ndarray, src: Panel, k0: complex | float, is_self: bool) -> complex:
@@ -1140,20 +1223,11 @@ def _integrate_kprime(obs: np.ndarray, n_obs: np.ndarray, src: Panel, k0: comple
 
     if is_self:
         return 0.0 + 0.0j
-    seg = src.p1 - src.p0
-    acc = 0.0 + 0.0j
-    distance = float(np.linalg.norm(obs - src.center))
-    ratio = distance / max(src.length, EPS)
-    order = 10
-    if ratio < 2.0:
-        order = 24
-    if ratio < 0.6:
-        order = 48
-    qt, qw = _get_quadrature(order)
-    for t, w in zip(qt, qw):
-        rp = src.p0 + t * seg
-        acc += w * _dgreen_dn_obs(k0, obs - rp, n_obs)
-    return acc * src.length
+    return _integrate_panel_generic(
+        obs,
+        src,
+        lambda o, rp: _dgreen_dn_obs(k0, o - rp, n_obs),
+    )
 
 
 def _integrate_k_source(obs: np.ndarray, src: Panel, k0: complex | float, is_self: bool) -> complex:
@@ -1161,20 +1235,29 @@ def _integrate_k_source(obs: np.ndarray, src: Panel, k0: complex | float, is_sel
 
     if is_self:
         return 0.0 + 0.0j
-    seg = src.p1 - src.p0
-    acc = 0.0 + 0.0j
-    distance = float(np.linalg.norm(obs - src.center))
-    ratio = distance / max(src.length, EPS)
-    order = 10
-    if ratio < 2.0:
-        order = 24
-    if ratio < 0.6:
-        order = 48
-    qt, qw = _get_quadrature(order)
+    return _integrate_panel_generic(
+        obs,
+        src,
+        lambda o, rp: _dgreen_dn_src(k0, o - rp, src.normal),
+    )
+
+
+def _observation_samples(panel: Panel, order: int = 2) -> List[Tuple[np.ndarray, float]]:
+    """
+    Observation-point averaging along each panel.
+
+    This is still pulse-basis, but reduces pure midpoint-collocation bias.
+    """
+
+    o = max(1, int(order))
+    if o == 1:
+        return [(panel.center, 1.0)]
+    qt, qw = _get_quadrature(o)
+    seg = panel.p1 - panel.p0
+    out: List[Tuple[np.ndarray, float]] = []
     for t, w in zip(qt, qw):
-        rp = src.p0 + t * seg
-        acc += w * _dgreen_dn_src(k0, obs - rp, src.normal)
-    return acc * src.length
+        out.append((panel.p0 + float(t) * seg, float(w)))
+    return out
 
 
 def _build_operator_matrices(panels: List[Panel], k0: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -1185,9 +1268,20 @@ def _build_operator_matrices(panels: List[Panel], k0: float) -> Tuple[np.ndarray
     kp_mat = np.zeros((n, n), dtype=np.complex128)
 
     for m, pm in enumerate(panels):
+        obs_samples = _observation_samples(pm, order=2)
         for n_idx, pn in enumerate(panels):
-            s_mat[m, n_idx] = _integrate_single_layer(pm.center, pn, k0, is_self=(m == n_idx))
-            kp_mat[m, n_idx] = _integrate_kprime(pm.center, pm.normal, pn, k0, is_self=(m == n_idx))
+            if m == n_idx:
+                s_mat[m, n_idx] = _integrate_single_layer(pm.center, pn, k0, is_self=True)
+                kp_mat[m, n_idx] = 0.0 + 0.0j
+                continue
+
+            s_val = 0.0 + 0.0j
+            kp_val = 0.0 + 0.0j
+            for obs, w in obs_samples:
+                s_val += float(w) * _integrate_single_layer(obs, pn, k0, is_self=False)
+                kp_val += float(w) * _integrate_kprime(obs, pm.normal, pn, k0, is_self=False)
+            s_mat[m, n_idx] = s_val
+            kp_mat[m, n_idx] = kp_val
 
     return s_mat, kp_mat
 
@@ -1200,9 +1294,20 @@ def _build_operator_matrices_coupled(panels: List[Panel], k0: complex | float) -
     k_mat = np.zeros((n, n), dtype=np.complex128)
 
     for m, pm in enumerate(panels):
+        obs_samples = _observation_samples(pm, order=2)
         for n_idx, pn in enumerate(panels):
-            s_mat[m, n_idx] = _integrate_single_layer(pm.center, pn, k0, is_self=(m == n_idx))
-            k_mat[m, n_idx] = _integrate_k_source(pm.center, pn, k0, is_self=(m == n_idx))
+            if m == n_idx:
+                s_mat[m, n_idx] = _integrate_single_layer(pm.center, pn, k0, is_self=True)
+                k_mat[m, n_idx] = 0.0 + 0.0j
+                continue
+
+            s_val = 0.0 + 0.0j
+            k_val = 0.0 + 0.0j
+            for obs, w in obs_samples:
+                s_val += float(w) * _integrate_single_layer(obs, pn, k0, is_self=False)
+                k_val += float(w) * _integrate_k_source(obs, pn, k0, is_self=False)
+            s_mat[m, n_idx] = s_val
+            k_mat[m, n_idx] = k_val
 
     return s_mat, k_mat
 
@@ -1240,6 +1345,50 @@ def _solve_linear_system(a_mat: np.ndarray, rhs: np.ndarray) -> np.ndarray:
     return sol
 
 
+def _prepare_linear_solver(a_mat: np.ndarray) -> PreparedLinearSolver:
+    """
+    Prepare reusable factorization for repeated solves with identical matrix.
+
+    Falls back gracefully when SciPy LU is unavailable.
+    """
+
+    is_square = a_mat.shape[0] == a_mat.shape[1]
+    if not is_square:
+        return PreparedLinearSolver(a_mat=a_mat, method="lstsq")
+
+    if _SCIPY_LINALG is not None:
+        try:
+            lu, piv = _SCIPY_LINALG.lu_factor(a_mat)
+            return PreparedLinearSolver(a_mat=a_mat, method="scipy_lu", lu=lu, piv=piv)
+        except Exception:
+            pass
+
+    return PreparedLinearSolver(a_mat=a_mat, method="numpy_solve")
+
+
+def _solve_with_prepared_solver(prepared: PreparedLinearSolver, rhs: np.ndarray) -> np.ndarray:
+    """Solve with a prepared linear-solver handle."""
+
+    if prepared.method == "scipy_lu" and _SCIPY_LINALG is not None and prepared.lu is not None and prepared.piv is not None:
+        return _SCIPY_LINALG.lu_solve((prepared.lu, prepared.piv), rhs)
+    if prepared.method == "numpy_solve":
+        return np.linalg.solve(prepared.a_mat, rhs)
+    sol, _, _, _ = np.linalg.lstsq(prepared.a_mat, rhs, rcond=None)
+    return sol
+
+
+def _solve_many_with_prepared_solver(prepared: PreparedLinearSolver, rhs_list: List[np.ndarray]) -> List[np.ndarray]:
+    """Solve A x_k = b_k for many right-hand-sides using one prepared handle."""
+
+    if not rhs_list:
+        return []
+    rhs_mat = np.column_stack(rhs_list)
+    sol_mat = _solve_with_prepared_solver(prepared, rhs_mat)
+    if sol_mat.ndim == 1:
+        sol_mat = sol_mat.reshape(-1, 1)
+    return [np.asarray(sol_mat[:, i], dtype=np.complex128) for i in range(sol_mat.shape[1])]
+
+
 def _residual_norm(a_mat: np.ndarray, x: np.ndarray, b: np.ndarray) -> float:
     denom = float(np.linalg.norm(b))
     if denom <= EPS:
@@ -1252,6 +1401,47 @@ def _cond_estimate(a_mat: np.ndarray) -> float:
         return float(np.linalg.cond(a_mat))
     except np.linalg.LinAlgError:
         return float("inf")
+
+
+def _adaptive_cfie_eps(k0: float, panel_lengths: np.ndarray) -> float:
+    """
+    Choose CFIE blending strength from electrical panel size.
+
+    This keeps stabilization weak on electrically small meshes and increases it
+    when electrical size grows, reducing resonant conditioning issues.
+    """
+
+    if panel_lengths.size == 0:
+        return CFIE_EPS
+    l_mean = float(np.mean(panel_lengths))
+    kh = abs(float(k0)) * max(l_mean, EPS)
+    if kh < 0.20:
+        eps = 2.0e-4
+    elif kh < 0.80:
+        eps = 5.0e-4
+    elif kh < 2.50:
+        eps = 1.0e-3
+    elif kh < 6.00:
+        eps = 2.0e-3
+    else:
+        eps = 5.0e-3
+    return float(min(1.0e-2, max(1.0e-4, eps)))
+
+
+def _resolve_worker_count(enabled: bool, requested: int, jobs: int) -> int:
+    """
+    Resolve thread-pool worker count for per-elevation parallel execution.
+
+    Returns 1 when parallel execution is disabled or not useful.
+    """
+
+    count = int(max(0, jobs))
+    if not enabled or count <= 1:
+        return 1
+    if int(requested) > 0:
+        return max(1, min(int(requested), count))
+    cpu = int(os.cpu_count() or 1)
+    return max(1, min(cpu, count))
 
 
 def evaluate_quality_gate(
@@ -1279,6 +1469,7 @@ def evaluate_quality_gate(
 
     residual_value = float(metadata.get("residual_norm_max", 0.0) or 0.0)
     condition_value = float(metadata.get("condition_est_max", 0.0) or 0.0)
+    condition_computed = bool(metadata.get("condition_est_computed", True))
     warnings_count = len(list(metadata.get("warnings", []) or []))
 
     violations: List[str] = []
@@ -1286,7 +1477,7 @@ def evaluate_quality_gate(
         violations.append(
             f"residual_norm_max={residual_value:.6g} exceeds limit {residual_limit:.6g}"
         )
-    if not math.isfinite(condition_value) or condition_value > condition_limit:
+    if condition_computed and (not math.isfinite(condition_value) or condition_value > condition_limit):
         violations.append(
             f"condition_est_max={condition_value:.6g} exceeds limit {condition_limit:.6g}"
         )
@@ -1305,10 +1496,71 @@ def evaluate_quality_gate(
         "values": {
             "residual_norm_max": residual_value,
             "condition_est_max": condition_value,
+            "condition_est_computed": condition_computed,
             "warnings_count": warnings_count,
         },
         "violations": violations,
     }
+
+
+def _build_system_matrix(
+    panels: List[Panel],
+    s_mat: np.ndarray,
+    kp_mat: np.ndarray,
+    z_eff: np.ndarray,
+    pol: str,
+    k0: float,
+    cfie_eps: float,
+) -> np.ndarray:
+    """Assemble legacy single-equation EFIE/MFIE-like system matrix A."""
+
+    n = len(panels)
+    a_mat = np.zeros((n, n), dtype=np.complex128)
+
+    for m, panel in enumerate(panels):
+        z = z_eff[m]
+
+        if pol == "TM" or panel.seg_type == 1:
+            a_mat[m, :] = s_mat[m, :]
+            a_mat[m, m] -= z
+            continue
+
+        y = 0.0 + 0.0j
+        if abs(z) > 1e-9:
+            y = 1.0 / z
+
+        a_mat[m, :] = kp_mat[m, :] + 1j * k0 * y * s_mat[m, :]
+        a_mat[m, m] -= 0.5
+
+        # CFIE stabilization to suppress internal resonant singularities.
+        a_mat[m, :] += cfie_eps * s_mat[m, :]
+        a_mat[m, m] -= cfie_eps * z
+
+    return a_mat
+
+
+def _build_system_rhs(
+    panels: List[Panel],
+    u_inc: np.ndarray,
+    du_dn: np.ndarray,
+    z_eff: np.ndarray,
+    pol: str,
+    k0: float,
+    cfie_eps: float,
+) -> np.ndarray:
+    """Assemble RHS vector for the legacy single-equation system."""
+
+    rhs = np.zeros(len(panels), dtype=np.complex128)
+    for m, panel in enumerate(panels):
+        z = z_eff[m]
+        if pol == "TM" or panel.seg_type == 1:
+            rhs[m] = -u_inc[m]
+            continue
+        y = 0.0 + 0.0j
+        if abs(z) > 1e-9:
+            y = 1.0 / z
+        rhs[m] = -du_dn[m] - 1j * k0 * y * u_inc[m] - cfie_eps * u_inc[m]
+    return rhs
 
 
 def _build_system(
@@ -1320,34 +1572,28 @@ def _build_system(
     z_eff: np.ndarray,
     pol: str,
     k0: float,
+    cfie_eps: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Assemble legacy single-equation EFIE/MFIE-like linear system."""
 
-    n = len(panels)
-    a_mat = np.zeros((n, n), dtype=np.complex128)
-    rhs = np.zeros(n, dtype=np.complex128)
-
-    for m, panel in enumerate(panels):
-        z = z_eff[m]
-
-        if pol == "TM" or panel.seg_type == 1:
-            a_mat[m, :] = s_mat[m, :]
-            a_mat[m, m] -= z
-            rhs[m] = -u_inc[m]
-            continue
-
-        y = 0.0 + 0.0j
-        if abs(z) > 1e-9:
-            y = 1.0 / z
-
-        a_mat[m, :] = kp_mat[m, :] + 1j * k0 * y * s_mat[m, :]
-        a_mat[m, m] -= 0.5
-
-        # Small CFIE stabilization to suppress internal resonant singularities.
-        a_mat[m, :] += CFIE_EPS * s_mat[m, :]
-        a_mat[m, m] -= CFIE_EPS * z
-
-        rhs[m] = -du_dn[m] - 1j * k0 * y * u_inc[m] - CFIE_EPS * u_inc[m]
+    a_mat = _build_system_matrix(
+        panels=panels,
+        s_mat=s_mat,
+        kp_mat=kp_mat,
+        z_eff=z_eff,
+        pol=pol,
+        k0=k0,
+        cfie_eps=cfie_eps,
+    )
+    rhs = _build_system_rhs(
+        panels=panels,
+        u_inc=u_inc,
+        du_dn=du_dn,
+        z_eff=z_eff,
+        pol=pol,
+        k0=k0,
+        cfie_eps=cfie_eps,
+    )
 
     return a_mat, rhs
 
@@ -1558,22 +1804,16 @@ def _augment_system_with_constraints(
     return np.vstack([a_mat, c_weighted]), np.concatenate([rhs, rhs_pad])
 
 
-def _build_coupled_system(
+def _build_coupled_matrix(
     panels: List[Panel],
     infos: List[PanelCoupledInfo],
     region_ops: Dict[int, Tuple[np.ndarray, np.ndarray]],
     pol: str,
-    k_air: float,
-    elev_deg: float,
-    junction_constraints: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Assemble coupled dielectric system (unknowns: [u_trace, q_minus])."""
+) -> np.ndarray:
+    """Assemble coupled dielectric system matrix A (unknowns: [u_trace, q_minus])."""
 
     n = len(panels)
     a_mat = np.zeros((2 * n, 2 * n), dtype=np.complex128)
-    rhs = np.zeros(2 * n, dtype=np.complex128)
-
-    u_inc_air = _incident_plane_wave(panels, k_air, elev_deg)
     row = 0
 
     for i, info in enumerate(infos):
@@ -1583,7 +1823,6 @@ def _build_coupled_system(
         row_u, row_q = _assemble_coupled_region_row(i, info.minus_region, s_minus, k_minus, infos)
         a_mat[row, :n] = row_u
         a_mat[row, n:] = row_q
-        rhs[row] = u_inc_air[i] if info.minus_has_incident else 0.0 + 0.0j
         row += 1
 
         if info.bc_kind == "transmission" and info.plus_region >= 0:
@@ -1591,7 +1830,6 @@ def _build_coupled_system(
             row_u, row_q = _assemble_coupled_region_row(i, info.plus_region, s_plus, k_plus, infos)
             a_mat[row, :n] = row_u
             a_mat[row, n:] = row_q
-            rhs[row] = u_inc_air[i] if info.plus_has_incident else 0.0 + 0.0j
             row += 1
             continue
 
@@ -1604,11 +1842,65 @@ def _build_coupled_system(
             if abs(z) > EPS:
                 a_mat[row, i] = 1.0 / z
             a_mat[row, n + i] = 1.0 + 0.0j
-        rhs[row] = 0.0 + 0.0j
         row += 1
 
     if row != 2 * n:
         raise RuntimeError(f"Internal coupled assembly mismatch: built {row} rows for {2 * n} unknowns.")
+    return a_mat
+
+
+def _build_coupled_rhs(
+    panels: List[Panel],
+    infos: List[PanelCoupledInfo],
+    k_air: float,
+    elev_deg: float,
+) -> np.ndarray:
+    """Assemble RHS for coupled dielectric system at one elevation."""
+
+    n = len(panels)
+    rhs = np.zeros(2 * n, dtype=np.complex128)
+    u_inc_air = _incident_plane_wave(panels, k_air, elev_deg)
+    row = 0
+    for i, info in enumerate(infos):
+        rhs[row] = u_inc_air[i] if info.minus_has_incident else 0.0 + 0.0j
+        row += 1
+
+        if info.bc_kind == "transmission" and info.plus_region >= 0:
+            rhs[row] = u_inc_air[i] if info.plus_has_incident else 0.0 + 0.0j
+            row += 1
+            continue
+
+        rhs[row] = 0.0 + 0.0j
+        row += 1
+
+    if row != 2 * n:
+        raise RuntimeError(f"Internal coupled RHS mismatch: built {row} rows for {2 * n} unknowns.")
+    return rhs
+
+
+def _build_coupled_system(
+    panels: List[Panel],
+    infos: List[PanelCoupledInfo],
+    region_ops: Dict[int, Tuple[np.ndarray, np.ndarray]],
+    pol: str,
+    k_air: float,
+    elev_deg: float,
+    junction_constraints: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Assemble coupled dielectric system (unknowns: [u_trace, q_minus])."""
+
+    a_mat = _build_coupled_matrix(
+        panels=panels,
+        infos=infos,
+        region_ops=region_ops,
+        pol=pol,
+    )
+    rhs = _build_coupled_rhs(
+        panels=panels,
+        infos=infos,
+        k_air=k_air,
+        elev_deg=elev_deg,
+    )
 
     if junction_constraints is not None and junction_constraints.size > 0:
         return _augment_system_with_constraints(a_mat, rhs, junction_constraints)
@@ -1691,6 +1983,11 @@ def solve_monostatic_rcs_2d(
     progress_callback: Callable[[int, int, str], None] | None = None,
     quality_thresholds: Dict[str, float | int] | None = None,
     strict_quality_gate: bool = False,
+    max_panels: int = MAX_PANELS_DEFAULT,
+    compute_condition_number: bool = False,
+    parallel_elevations: bool = True,
+    max_elevation_workers: int = 0,
+    reuse_angle_invariant_matrix: bool = True,
 ) -> Dict[str, Any]:
     """
     Main entry point for monostatic 2D RCS.
@@ -1699,6 +1996,12 @@ def solve_monostatic_rcs_2d(
     - build operators,
     - per elevation assemble/solve linear system,
     - compute backscatter RCS and diagnostics.
+
+    Performance controls:
+    - compute_condition_number=False skips expensive per-angle condition estimates.
+    - reuse_angle_invariant_matrix=True reuses one matrix factorization when A is
+      elevation-invariant.
+    - parallel_elevations=True enables per-elevation threading for angle-varying A.
     """
 
     if not frequencies_ghz:
@@ -1716,7 +2019,12 @@ def solve_monostatic_rcs_2d(
 
     f_max = max(frequencies)
     lambda_min = C0 / (f_max * 1e9)
-    panels = _build_panels(geometry_snapshot, unit_scale, lambda_min)
+    panels = _build_panels(
+        geometry_snapshot,
+        unit_scale,
+        lambda_min,
+        max_panels=max_panels,
+    )
 
     base_dir = material_base_dir or os.getcwd()
     materials = MaterialLibrary.from_entries(
@@ -1731,7 +2039,11 @@ def solve_monostatic_rcs_2d(
 
     residual_values: List[float] = []
     cond_values: List[float] = []
+    cfie_eps_values: List[float] = []
     panel_lengths = np.asarray([p.length for p in panels], dtype=float)
+    reused_matrix_solve_count = 0
+    parallel_elevation_solve_count = 0
+    max_parallel_workers_used = 1
 
     def emit_progress(message: str) -> None:
         if progress_callback is None:
@@ -1777,74 +2089,273 @@ def solve_monostatic_rcs_2d(
             emit_progress(f"Assembled coupled operators at {freq_ghz:g} GHz")
 
             n_panels = len(panels)
+            a_core = _build_coupled_matrix(
+                panels=panels,
+                infos=coupled_infos,
+                region_ops=region_ops,
+                pol=pol,
+            )
+            rhs_pad_count = 0
+            if junction_constraints.size > 0:
+                a_mat, rhs_seed = _augment_system_with_constraints(
+                    a_core,
+                    np.zeros(2 * n_panels, dtype=np.complex128),
+                    junction_constraints,
+                )
+                rhs_pad_count = int(max(0, rhs_seed.shape[0] - (2 * n_panels)))
+            else:
+                a_mat = a_core
+
+            if compute_condition_number:
+                cond_values.append(_cond_estimate(a_mat))
+            prepared = _prepare_linear_solver(a_mat)
+
+            rhs_list: List[np.ndarray] = []
             for elev_deg in elevations:
-                a_mat, rhs = _build_coupled_system(
+                rhs = _build_coupled_rhs(
                     panels=panels,
                     infos=coupled_infos,
-                    region_ops=region_ops,
-                    pol=pol,
                     k_air=k0,
                     elev_deg=elev_deg,
-                    junction_constraints=junction_constraints,
                 )
-                cond_values.append(_cond_estimate(a_mat))
-                sol = _solve_linear_system(a_mat, rhs)
-                residual_values.append(_residual_norm(a_mat, sol, rhs))
+                if rhs_pad_count > 0:
+                    rhs = np.concatenate([rhs, np.zeros(rhs_pad_count, dtype=np.complex128)])
+                rhs_list.append(rhs)
+
+            solutions = _solve_many_with_prepared_solver(prepared, rhs_list)
+            reused_matrix_solve_count += len(elevations)
+            workers = _resolve_worker_count(
+                enabled=parallel_elevations,
+                requested=max_elevation_workers,
+                jobs=len(elevations),
+            )
+            max_parallel_workers_used = max(max_parallel_workers_used, workers)
+
+            def _post_coupled(idx: int, elev_deg: float) -> Tuple[int, Dict[str, Any], float]:
+                rhs = rhs_list[idx]
+                sol = solutions[idx]
+                residual_local = _residual_norm(a_mat, sol, rhs)
                 u_trace = sol[:n_panels]
                 q_minus = sol[n_panels:]
-                rcs_lin, rcs_amp = _backscatter_rcs_coupled(panels, coupled_infos, u_trace, q_minus, k0, elev_deg)
-                rcs_db = 10.0 * math.log10(rcs_lin)
-
-                samples.append(
-                    {
-                        "frequency_ghz": float(freq_ghz),
-                        "theta_inc_deg": float(elev_deg),
-                        "theta_scat_deg": float(elev_deg),
-                        "rcs_linear": float(rcs_lin),
-                        "rcs_db": float(rcs_db),
-                        "rcs_amp_real": float(np.real(rcs_amp)),
-                        "rcs_amp_imag": float(np.imag(rcs_amp)),
-                        "rcs_amp_phase_deg": float(math.degrees(cmath.phase(rcs_amp))),
-                        "linear_residual": float(residual_values[-1]),
-                    }
+                rcs_lin_local, rcs_amp_local = _backscatter_rcs_coupled(
+                    panels, coupled_infos, u_trace, q_minus, k0, elev_deg
                 )
-                done_steps += 1
-                emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
-            continue
-
-        s_mat, kp_mat = _build_operator_matrices(panels, k0)
-        done_steps += 1
-        emit_progress(f"Assembled operators at {freq_ghz:g} GHz")
-
-        for elev_deg in elevations:
-            u_inc, du_dn, cos_inc = _incident_values(panels, k0, elev_deg)
-
-            z_eff = np.zeros(len(panels), dtype=np.complex128)
-            for i, p in enumerate(panels):
-                z_eff[i] = _panel_effective_impedance(p, materials, freq_ghz, pol, cos_inc[i])
-
-            a_mat, rhs = _build_system(panels, s_mat, kp_mat, u_inc, du_dn, z_eff, pol, k0)
-            cond_values.append(_cond_estimate(a_mat))
-            sigma = _solve_linear_system(a_mat, rhs)
-            residual_values.append(_residual_norm(a_mat, sigma, rhs))
-            rcs_lin, rcs_amp = _backscatter_rcs(panels, sigma, k0, elev_deg)
-            rcs_db = 10.0 * math.log10(rcs_lin)
-
-            samples.append(
-                {
+                rcs_db_local = 10.0 * math.log10(rcs_lin_local)
+                sample_local = {
                     "frequency_ghz": float(freq_ghz),
                     "theta_inc_deg": float(elev_deg),
                     "theta_scat_deg": float(elev_deg),
-                    "rcs_linear": float(rcs_lin),
-                    "rcs_db": float(rcs_db),
-                    "rcs_amp_real": float(np.real(rcs_amp)),
-                    "rcs_amp_imag": float(np.imag(rcs_amp)),
-                    "rcs_amp_phase_deg": float(math.degrees(cmath.phase(rcs_amp))),
-                    "linear_residual": float(residual_values[-1]),
+                    "rcs_linear": float(rcs_lin_local),
+                    "rcs_db": float(rcs_db_local),
+                    "rcs_amp_real": float(np.real(rcs_amp_local)),
+                    "rcs_amp_imag": float(np.imag(rcs_amp_local)),
+                    "rcs_amp_phase_deg": float(math.degrees(cmath.phase(rcs_amp_local))),
+                    "linear_residual": float(residual_local),
                 }
+                return idx, sample_local, float(residual_local)
+
+            if workers > 1:
+                parallel_elevation_solve_count += len(elevations)
+                staged_coupled: List[Tuple[int, Dict[str, Any], float]] = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                    future_map = {
+                        ex.submit(_post_coupled, idx, elev_deg): (idx, elev_deg)
+                        for idx, elev_deg in enumerate(elevations)
+                    }
+                    for fut in concurrent.futures.as_completed(future_map):
+                        idx, elev_deg = future_map[fut]
+                        i_out, sample_out, residual_out = fut.result()
+                        staged_coupled.append((i_out, sample_out, residual_out))
+                        done_steps += 1
+                        emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
+                staged_coupled.sort(key=lambda t: t[0])
+                for _, sample_out, residual_out in staged_coupled:
+                    samples.append(sample_out)
+                    residual_values.append(float(residual_out))
+            else:
+                for idx, elev_deg in enumerate(elevations):
+                    _, sample_out, residual_out = _post_coupled(idx, elev_deg)
+                    samples.append(sample_out)
+                    residual_values.append(float(residual_out))
+                    done_steps += 1
+                    emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
+            continue
+
+        s_mat, kp_mat = _build_operator_matrices(panels, k0)
+        cfie_eps_freq = _adaptive_cfie_eps(k0, panel_lengths)
+        cfie_eps_values.append(float(cfie_eps_freq))
+        done_steps += 1
+        emit_progress(f"Assembled operators at {freq_ghz:g} GHz")
+
+        angle_invariant_matrix = bool(
+            reuse_angle_invariant_matrix and not any(p.seg_type in {3, 5} for p in panels)
+        )
+
+        if angle_invariant_matrix:
+            z_eff = np.zeros(len(panels), dtype=np.complex128)
+            for i, p in enumerate(panels):
+                z_eff[i] = _panel_effective_impedance(p, materials, freq_ghz, pol, 1.0)
+
+            a_mat = _build_system_matrix(
+                panels=panels,
+                s_mat=s_mat,
+                kp_mat=kp_mat,
+                z_eff=z_eff,
+                pol=pol,
+                k0=k0,
+                cfie_eps=cfie_eps_freq,
             )
-            done_steps += 1
-            emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
+            if compute_condition_number:
+                cond_values.append(_cond_estimate(a_mat))
+            prepared = _prepare_linear_solver(a_mat)
+
+            rhs_list: List[np.ndarray] = []
+            for elev_deg in elevations:
+                u_inc, du_dn, _ = _incident_values(panels, k0, elev_deg)
+                rhs = _build_system_rhs(
+                    panels=panels,
+                    u_inc=u_inc,
+                    du_dn=du_dn,
+                    z_eff=z_eff,
+                    pol=pol,
+                    k0=k0,
+                    cfie_eps=cfie_eps_freq,
+                )
+                rhs_list.append(rhs)
+
+            solutions = _solve_many_with_prepared_solver(prepared, rhs_list)
+            reused_matrix_solve_count += len(elevations)
+            workers = _resolve_worker_count(
+                enabled=parallel_elevations,
+                requested=max_elevation_workers,
+                jobs=len(elevations),
+            )
+            max_parallel_workers_used = max(max_parallel_workers_used, workers)
+
+            def _post_reused(idx: int, elev_deg: float) -> Tuple[int, Dict[str, Any], float]:
+                rhs = rhs_list[idx]
+                sigma = solutions[idx]
+                residual_local = _residual_norm(a_mat, sigma, rhs)
+                rcs_lin_local, rcs_amp_local = _backscatter_rcs(panels, sigma, k0, elev_deg)
+                rcs_db_local = 10.0 * math.log10(rcs_lin_local)
+                sample_local = {
+                    "frequency_ghz": float(freq_ghz),
+                    "theta_inc_deg": float(elev_deg),
+                    "theta_scat_deg": float(elev_deg),
+                    "rcs_linear": float(rcs_lin_local),
+                    "rcs_db": float(rcs_db_local),
+                    "rcs_amp_real": float(np.real(rcs_amp_local)),
+                    "rcs_amp_imag": float(np.imag(rcs_amp_local)),
+                    "rcs_amp_phase_deg": float(math.degrees(cmath.phase(rcs_amp_local))),
+                    "linear_residual": float(residual_local),
+                }
+                return idx, sample_local, float(residual_local)
+
+            if workers > 1:
+                parallel_elevation_solve_count += len(elevations)
+                staged_reused: List[Tuple[int, Dict[str, Any], float]] = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                    future_map = {
+                        ex.submit(_post_reused, idx, elev_deg): (idx, elev_deg)
+                        for idx, elev_deg in enumerate(elevations)
+                    }
+                    for fut in concurrent.futures.as_completed(future_map):
+                        idx, elev_deg = future_map[fut]
+                        i_out, sample_out, residual_out = fut.result()
+                        staged_reused.append((i_out, sample_out, residual_out))
+                        done_steps += 1
+                        emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
+                staged_reused.sort(key=lambda t: t[0])
+                for _, sample_out, residual_out in staged_reused:
+                    samples.append(sample_out)
+                    residual_values.append(float(residual_out))
+            else:
+                for idx, elev_deg in enumerate(elevations):
+                    _, sample_out, residual_out = _post_reused(idx, elev_deg)
+                    samples.append(sample_out)
+                    residual_values.append(float(residual_out))
+                    done_steps += 1
+                    emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
+            continue
+
+        def _solve_one_elevation(idx: int, elev_deg: float) -> Tuple[int, Dict[str, Any], float, float | None]:
+            u_inc, du_dn, cos_inc = _incident_values(panels, k0, elev_deg)
+            z_local = np.zeros(len(panels), dtype=np.complex128)
+            for i, p in enumerate(panels):
+                z_local[i] = _panel_effective_impedance(p, materials, freq_ghz, pol, cos_inc[i])
+            a_local = _build_system_matrix(
+                panels=panels,
+                s_mat=s_mat,
+                kp_mat=kp_mat,
+                z_eff=z_local,
+                pol=pol,
+                k0=k0,
+                cfie_eps=cfie_eps_freq,
+            )
+            rhs_local = _build_system_rhs(
+                panels=panels,
+                u_inc=u_inc,
+                du_dn=du_dn,
+                z_eff=z_local,
+                pol=pol,
+                k0=k0,
+                cfie_eps=cfie_eps_freq,
+            )
+            cond_local = _cond_estimate(a_local) if compute_condition_number else None
+            sigma_local = _solve_linear_system(a_local, rhs_local)
+            residual_local = _residual_norm(a_local, sigma_local, rhs_local)
+            rcs_lin_local, rcs_amp_local = _backscatter_rcs(panels, sigma_local, k0, elev_deg)
+            rcs_db_local = 10.0 * math.log10(rcs_lin_local)
+            sample_local = {
+                "frequency_ghz": float(freq_ghz),
+                "theta_inc_deg": float(elev_deg),
+                "theta_scat_deg": float(elev_deg),
+                "rcs_linear": float(rcs_lin_local),
+                "rcs_db": float(rcs_db_local),
+                "rcs_amp_real": float(np.real(rcs_amp_local)),
+                "rcs_amp_imag": float(np.imag(rcs_amp_local)),
+                "rcs_amp_phase_deg": float(math.degrees(cmath.phase(rcs_amp_local))),
+                "linear_residual": float(residual_local),
+            }
+            return idx, sample_local, float(residual_local), cond_local
+
+        workers = _resolve_worker_count(
+            enabled=parallel_elevations,
+            requested=max_elevation_workers,
+            jobs=len(elevations),
+        )
+        max_parallel_workers_used = max(max_parallel_workers_used, workers)
+
+        if workers > 1:
+            parallel_elevation_solve_count += len(elevations)
+            staged: List[Tuple[int, Dict[str, Any], float, float | None]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                future_map = {
+                    ex.submit(_solve_one_elevation, idx, elev_deg): (idx, elev_deg)
+                    for idx, elev_deg in enumerate(elevations)
+                }
+                for fut in concurrent.futures.as_completed(future_map):
+                    idx, elev_deg = future_map[fut]
+                    i_out, sample_out, residual_out, cond_out = fut.result()
+                    staged.append((i_out, sample_out, residual_out, cond_out))
+                    done_steps += 1
+                    emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
+
+            staged.sort(key=lambda t: t[0])
+            for _, sample_out, residual_out, cond_out in staged:
+                samples.append(sample_out)
+                residual_values.append(float(residual_out))
+                if cond_out is not None:
+                    cond_values.append(float(cond_out))
+        else:
+            for idx, elev_deg in enumerate(elevations):
+                _, sample_out, residual_out, cond_out = _solve_one_elevation(idx, elev_deg)
+                samples.append(sample_out)
+                residual_values.append(float(residual_out))
+                if cond_out is not None:
+                    cond_values.append(float(cond_out))
+                done_steps += 1
+                emit_progress(f"Solved {freq_ghz:g} GHz at {elev_deg:g} deg")
 
     done_steps = total_steps
     emit_progress("Completed")
@@ -1864,6 +2375,7 @@ def solve_monostatic_rcs_2d(
             "panel_length_max_m": float(np.max(panel_lengths)),
             "frequency_count": len(frequencies),
             "elevation_count": len(elevations),
+            "max_panels_limit": int(max(1, int(max_panels))),
             "bessel_backend": "libm" if _BESSEL.available else "series-fallback",
             "complex_hankel_backend": _complex_hankel_backend_name(),
             "junction_nodes": int(junction_stats.get("junction_nodes", 0)),
@@ -1873,8 +2385,18 @@ def solve_monostatic_rcs_2d(
             "junction_flux_constraints": int(junction_stats.get("junction_flux_constraints", 0)),
             "residual_norm_max": float(np.max(residual_values)) if residual_values else 0.0,
             "residual_norm_mean": float(np.mean(residual_values)) if residual_values else 0.0,
+            "condition_est_computed": bool(compute_condition_number),
+            "condition_est_count": int(len(cond_values)),
             "condition_est_max": float(np.max(cond_values)) if cond_values else 0.0,
             "condition_est_mean": float(np.mean(cond_values)) if cond_values else 0.0,
+            "reuse_angle_invariant_matrix": bool(reuse_angle_invariant_matrix),
+            "matrix_reuse_solve_count": int(reused_matrix_solve_count),
+            "parallel_elevations_enabled": bool(parallel_elevations),
+            "parallel_elevation_solve_count": int(parallel_elevation_solve_count),
+            "parallel_elevation_workers_used": int(max(1, max_parallel_workers_used)),
+            "cfie_eps_min": float(np.min(cfie_eps_values)) if cfie_eps_values else 0.0,
+            "cfie_eps_max": float(np.max(cfie_eps_values)) if cfie_eps_values else 0.0,
+            "cfie_eps_mean": float(np.mean(cfie_eps_values)) if cfie_eps_values else 0.0,
             "warnings": list(materials.warnings),
         },
     }

@@ -190,6 +190,7 @@ def _solve_case(
         material_base_dir=base_dir,
         quality_thresholds=quality_thresholds,
         strict_quality_gate=False,
+        compute_condition_number=True,
     )
     return result
 

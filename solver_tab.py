@@ -132,6 +132,7 @@ class _SolveWorker(QObject):
                     progress_callback=base_cb,
                     quality_thresholds=self.quality_thresholds,
                     strict_quality_gate=self.strict_quality_gate,
+                    compute_condition_number=self.strict_quality_gate,
                 )
                 self.progress.emit(61, "Running mesh convergence fine-mesh solve...")
                 fine_snapshot = scale_snapshot_panel_density(self.snapshot, self.mesh_fine_factor)
@@ -155,6 +156,7 @@ class _SolveWorker(QObject):
                     progress_callback=fine_cb,
                     quality_thresholds=self.quality_thresholds,
                     strict_quality_gate=False,
+                    compute_condition_number=False,
                 )
                 mesh_gate = evaluate_mesh_convergence(
                     base_result=result,
@@ -181,6 +183,7 @@ class _SolveWorker(QObject):
                     progress_callback=self._on_progress,
                     quality_thresholds=self.quality_thresholds,
                     strict_quality_gate=self.strict_quality_gate,
+                    compute_condition_number=self.strict_quality_gate,
                 )
         except Exception as exc:
             self.error.emit(str(exc))
