@@ -26,7 +26,8 @@ COMMON: Dict[str, Any] = {
     "frequency_list_ghz": [1.0, 2.0, 3.0],
     "frequency_sweep_ghz": {"start": 1.0, "stop": 10.0, "step": 0.5},
 
-    # Azimuth setup (solver elevation angles in degrees)
+    # Azimuth setup (incoming "coming-from" angles in degrees):
+    # 0 = from right, +90 = from top, -90 = from bottom
     "azimuth_mode": "list",  # "list" or "sweep"
     "azimuth_list_deg": [0.0, 45.0, 90.0, 135.0, 180.0],
     "azimuth_sweep_deg": {"start": 0.0, "stop": 180.0, "step": 2.0},

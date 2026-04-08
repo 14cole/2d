@@ -1312,9 +1312,22 @@ def _build_operator_matrices_coupled(panels: List[Panel], k0: complex | float) -
     return s_mat, k_mat
 
 
+def _propagation_direction_from_user_angle(elev_deg: float) -> np.ndarray:
+    """
+    Convert user "coming-from" angle convention to propagation direction.
+
+    Convention:
+    - 0 deg: coming from +x (right), propagating toward -x.
+    - +90 deg: coming from +y (top), propagating toward -y.
+    - -90 deg: coming from -y (bottom), propagating toward +y.
+    """
+
+    phi = math.radians(elev_deg)
+    return np.asarray([-math.cos(phi), -math.sin(phi)], dtype=float)
+
+
 def _incident_values(panels: List[Panel], k0: float, elev_deg: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    theta = math.radians(elev_deg)
-    direction = np.asarray([math.cos(theta), math.sin(theta)], dtype=float)
+    direction = _propagation_direction_from_user_angle(elev_deg)
 
     n = len(panels)
     u_inc = np.zeros(n, dtype=np.complex128)
@@ -1606,8 +1619,8 @@ def _backscatter_rcs(
 ) -> Tuple[float, complex]:
     """Convert solved legacy current to monostatic 2D RCS and complex amplitude."""
 
-    theta = math.radians(elev_deg)
-    scatter_dir = np.asarray([-math.cos(theta), -math.sin(theta)], dtype=float)
+    inc_dir = _propagation_direction_from_user_angle(elev_deg)
+    scatter_dir = -inc_dir
 
     amp = 0.0 + 0.0j
     for panel, cur in zip(panels, sigma):
@@ -1623,8 +1636,7 @@ def _backscatter_rcs(
 def _incident_plane_wave(panels: List[Panel], k_air: float, elev_deg: float) -> np.ndarray:
     """Incident field trace sampled at panel centers for one elevation."""
 
-    theta = math.radians(elev_deg)
-    direction = np.asarray([math.cos(theta), math.sin(theta)], dtype=float)
+    direction = _propagation_direction_from_user_angle(elev_deg)
     out = np.zeros(len(panels), dtype=np.complex128)
     for i, p in enumerate(panels):
         phase = float(np.dot(direction, p.center))
@@ -1917,8 +1929,8 @@ def _backscatter_rcs_coupled(
 ) -> Tuple[float, complex]:
     """Convert coupled solution traces/fluxes into monostatic 2D RCS and complex amplitude."""
 
-    theta = math.radians(elev_deg)
-    scatter_dir = np.asarray([-math.cos(theta), -math.sin(theta)], dtype=float)
+    inc_dir = _propagation_direction_from_user_angle(elev_deg)
+    scatter_dir = -inc_dir
 
     amp = 0.0 + 0.0j
     for panel, info, u_val, q_m in zip(panels, infos, u_trace, q_minus):
@@ -1996,6 +2008,11 @@ def solve_monostatic_rcs_2d(
     - build operators,
     - per elevation assemble/solve linear system,
     - compute backscatter RCS and diagnostics.
+
+    Angle convention (coming-from):
+    - 0 deg: from right to left
+    - +90 deg: from top to bottom
+    - -90 deg: from bottom to top
 
     Performance controls:
     - compute_condition_number=False skips expensive per-angle condition estimates.
